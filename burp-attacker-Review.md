@@ -1,369 +1,254 @@
 ---
 name: burp-attacker-review
 description: >-
-  Burp MCP workflow for deep attacker-view vulnerability assessment from Proxy HTTP History. Use when Codex needs to snapshot
-  a target's Burp traffic, ignore low-value header-only findings, identify meaningful attack points across access control, account/
-  authenticator lifecycle, sensitive data exposure, SSRF, SSTI, injection, XXE, XSS, CSRF, upload/download, admin/file/method exposure,
-  business logic, or other exploit-oriented web security classes, thoroughly verify whether vulnerabilities actually exist, and write a
-  findings file (md/txt) in the current folder containing the core issue and reusable HTTP payloads for confirmed findings or items needing
-  manual confirmation.
+  Actively verifies prioritized web vulnerability candidates from a Burp surface-map state using targeted raw-packet retrieval, safe differential tests, feature-by-feature summaries, and a final cross-feature review. Use for authorized deep assessment after mapping, or for a focused review by feature, vulnerability class, candidate, or newly observed traffic. Avoid rebuilding or repeatedly loading full Burp History when compatible state exists.
 ---
 
 # Burp Attacker Review
 
 ## Objective
 
-Assess a changing web target from Burp Proxy History as an attacker would: map real behavior, select high-signal hypotheses, verify them
-with low-risk requests, and deliver a findings file with payloads that reproduce the evidence.
+Verify meaningful attacker-view hypotheses from Burp traffic while keeping context bounded. Consume the compact state produced by `burp-surface-map`, retrieve only the raw packets required for the current candidate, run low-risk control comparisons, update candidate dispositions, and write evidence-backed findings.
 
-This is a project-agnostic skill. Apply project-specific rules, report formats, asset classifications, or checklist overlays only when
-the current workspace instructions or user request explicitly provide them. Do not assume any fixed customer, domain, product, or
-internal checklist is present.
+Do not lead with missing headers, cookie flags, banners, or scanner-style configuration observations unless they materially increase a verified attack path.
 
-Do not lead with missing security headers, cookie flags, banner disclosure, or other configuration-only findings unless they materially
-increase the exploitability of a verified attack path.
+This skill assumes an authorized assessment. Default to non-destructive verification and stop for additional authorization when a test would cause material side effects, access third-party data, notify users, spend funds or OTPs, lock accounts, or modify non-disposable records.
 
-Prefer depth over speed. Do not stop after the first valid finding; continue until the target's observed endpoints, parameters, state-
-changing actions, sensitive surfaces, and server-side sinks have been reviewed and classified.
+## State Contract
+
+Primary state:
+
+```text
+.burp-review/<target-key>/state.json
+```
+
+If compatible current state exists, treat it as the primary analysis index. Do not rebuild the complete endpoint inventory from raw History unless state is missing, stale, schema-incompatible, or materially contradicted by current traffic.
+
+If state is missing, perform one lightweight target-scoped indexing pass compatible with the `burp-surface-map` schema, then continue. Do not make multiple full-History passes. If traffic has materially changed, recommend or perform an incremental surface-map refresh before broad review.
+
+Preserve earlier dispositions and negative evidence. Reopen a candidate only when new evidence materially changes its endpoint, role, parameter, sink, or response model.
+
+## Modes
+
+Select the smallest mode that satisfies the request:
+
+- `all` (default): review all remaining high-priority candidates, then medium-priority candidates as budget allows.
+- `feature <feature-id>`: review unresolved candidates in one feature.
+- `class <vulnerability-class>`: review candidates of one applicable class.
+- `candidate <candidate-id>`: verify one candidate.
+- `new`: review only candidates marked `new_since_last_review`.
+- `remaining`: continue unresolved candidates without reopening disposed ones.
+- `cross-feature`: analyze stored feature summaries and retrieve raw packets only for a specific cross-feature hypothesis.
+
+Do not interpret `all` as loading all raw packets at once. It means process the feature queue serially.
 
 ## Tool Setup
 
-- Use Burp MCP tools when available. If Burp tools are not loaded, discover them with `tool_search` using a query such as `burp proxy
-history send http request`.
-- Prefer `get_proxy_http_history_regex` for target-scoped snapshots.
-- Use `send_http1_request` or `send_http2_request` for verification.
-- For confirmed findings, control comparisons, and important manual checks, record the request as a payload in the findings file (see
-  step 6).
-- For SSRF/XXE/OOB checks, use Burp Collaborator or this skill's bundled callback server at `<skill_dir>/scripts/oob_http_server.py`
-when the target can reach the tester host. Resolve `<skill_dir>` from the directory containing this `SKILL.md`; do not assume the
-current project contains the script.
+- Use Burp MCP Proxy History tools to retrieve captured packets by stable reference or narrow host/path/method query.
+- Use the matching HTTP/1 or HTTP/2 request-sending tool for authorized verification.
+- Use browser rendering only when execution context is essential, such as XSS confirmation.
+- Use Burp Collaborator or another user-authorized callback service for OOB verification. Do not start external listeners, scan internal networks, or use local-file disclosure payloads without appropriate authorization.
 
-## Inputs
+## Context Budget
 
-Derive or ask only if missing:
+- Analyze one feature cluster at a time.
+- Default to at most 15 raw packets per feature and 6 active candidates per feature in one pass.
+- Start with one baseline and one meaningful control per candidate. Expand only when the result remains high-value and unsettled.
+- Keep at most 30 active candidates in one `all` run; report remaining queued candidates rather than silently skipping them.
+- After a feature is processed, release its raw packet detail from working context and retain only the redacted feature summary, candidate dispositions, packet references, and evidence.
+- Re-query narrowly when evidence is missing. Never reload the full raw History merely to regain context.
 
-- `target_host`: required primary user-facing target, for example `app.example.com`.
-- `scope_hosts`: derived list of in-scope hosts. Start with `target_host`, then add related API/auth/resource hosts observed in Burp
-History when they are called by the primary target or clearly serve the same feature flow.
-- `scheme` and `port`: default to HTTPS/443 when History indicates HTTPS.
-- `scope`: default to Burp History for `target_host` plus derived `scope_hosts`.
-- `risk_limit`: default to non-destructive verification only.
-
-## Depth Standard
-
-- Spend the time and tokens needed for a careful review.
-- Make multiple passes over Burp History: first for endpoint inventory, second for parameters and IDs, third for state-changing actions,
-fourth for sensitive data and server-side sinks.
-- Re-query History with narrower regexes when a promising path appears.
-- For every confirmed issue, still continue looking for unrelated issue classes.
-- Preserve negative evidence: record meaningful hypotheses that were tested and not reproduced.
-- Prefer a smaller number of well-proven findings over a long list of speculative scanner-style issues.
+User-specified time, request, or risk limits override these defaults.
 
 ## Workflow
 
-### 1. Snapshot Burp History
+### 1. Load and Validate State
 
-Collect a feature-scoped packet snapshot, not just a single-host snapshot:
+1. Resolve the target and state path.
+2. Check schema compatibility, scope hosts, snapshot cursor/timestamp, and unresolved candidates.
+3. Select candidates using the requested mode, then order by priority, score, and likely impact.
+4. Mark selected candidates `queued`; leave all other state untouched.
+5. If current Burp traffic reveals new endpoints or security-relevant variants, add them through a bounded incremental map rather than restarting analysis.
 
-The snapshot is a point-in-time analysis baseline. Capture and summarize the relevant History items at the start of the review because
-Burp History may continue changing while the user browses/tests, and the user may clear History during or after the review. Base the
-current review on this initial snapshot unless the user explicitly asks to refresh or extend it.
+### 2. Build a Feature Queue
 
-1. Query History for `target_host`.
-2. Derive related hosts before concluding coverage is complete. Include a host in `scope_hosts` when evidence shows it belongs to the
-same tested flow:
-   - Request `Host` differs from `target_host` but has `Origin` or `Referer` from `target_host`.
-   - Browser XHR/fetch/API calls from the target page go to that host.
-   - Static JavaScript from the target references that host or API base URL.
-   - Host shares session cookies, bearer tokens, CSRF headers, product path prefixes, or business identifiers with the target flow.
-   - Path names clearly bind it to the target feature, for example `api.example.com/orders/v1/...` for `portal.example.com`.
-3. Query History for each derived `scope_host`. Also query bounded domain/path patterns when needed, such as:
-   - Same organization domain plus feature keyword: `example.com.*orders`, `orders.*example.com`.
-   - API host patterns visible in History: `api.`, `s-api.`, `m-api.`, `gateway.`, `auth.`, `login.`, `static.`, `cdn.`.
-   - Login paths, API prefixes, file/download endpoints, admin paths, or state-changing methods.
-4. Avoid unconstrained subdomain enumeration or broad wordlist discovery unless the user explicitly authorizes it. A related host must
-be evidence-backed by History, page content, JavaScript, shared auth material, or a clear feature path.
-5. Extract the useful map across all `scope_hosts`:
-   - Authentication flow and role/account indicators.
-   - Cookies, bearer tokens, CSRF tokens, and refresh behavior, with values redacted in notes.
-   - Host-to-host relationships: primary UI host, API hosts, auth hosts, static/resource hosts, and which requests connect them.
-   - Endpoints, methods, query/body parameters, JSON keys, and numeric IDs.
-   - Status patterns: `200`, `302`, `401`, `403`, `404`, `500`.
-   - State-changing endpoints: `POST`, `PUT`, `PATCH`, `DELETE`, plus JavaScript-triggered actions.
-   - Sensitive response surfaces: exports, keys, personal data, admin pages, write forms, hidden fields.
-   - Sensitive data categories in responses or browser-visible state: passwords, national or identity verification numbers, account/card
-   numbers, email, phone, name, birthdate/sex, member/customer IDs, GUIDs, device identifiers, MAC/IP, country, service usage records,
-   partner personal data, and comparable regulated data.
-   - Account/security workflows: login, logout, password change/reset, OTP/SMS/email/voice verification, device or account ownership
-   binding, step-up authentication, approval flows, and identity verification steps.
-   - Server-side sinks suggested by parameters, bodies, content types, or features:
-     URL fetchers, webhooks, imports, XML parsers, template/render endpoints, file paths, uploads, search/filter/sort fields, report/
-     export builders, shell-like job runners, and LLM/chat/prompt endpoints.
+Process a single feature at a time. For each feature:
 
-Summarize the snapshot before testing: primary target, derived `scope_hosts`, evidence for including each related host, observed roles/
-session, primary endpoint clusters, and candidate attack surfaces.
+1. Load its endpoint metadata and unresolved candidates.
+2. Retrieve representative baseline packets only for the selected candidates.
+3. Confirm the actual behavior, sink, authentication mode, role, and state transition before choosing a test.
+4. Apply vulnerability prerequisites. A structural cue may create a hypothesis but does not justify a probe by itself.
+5. Define the expected vulnerable result and a control comparison before sending a request.
 
-### 2. Filter Out Noise
+Prioritize authentication, authorization, tenant boundaries, account security, admin functions, financial/approval actions, sensitive data, file operations, and proven server-side sinks.
 
-Default exclude:
+### 3. Apply Class Gates
 
-- Missing or weak security headers.
-- Cookie flag issues by themselves.
-- Version banners by themselves.
-- Generic CORS observations without a cross-origin credentialed exploit path.
-- Scanner-style findings not tied to a reachable exploit.
+Activate a class only when its prerequisites are observed:
 
-Keep these only as supporting context when they amplify a verified issue, such as XSS plus non-HttpOnly tokens.
+| Class | Required evidence before active testing |
+| --- | --- |
+| IDOR/BOLA | User-controlled object/tenant reference and an ownership boundary |
+| RBAC/authorization | Protected action/resource and distinct privilege context or a defined expected role |
+| CSRF | State-changing action, ambient browser credential, and plausible cross-site request delivery; consider SameSite, token binding, Origin/Referer checks, and content-type constraints |
+| SSRF | Evidence that the server consumes a URL/host or performs a fetch/callback/import |
+| XXE | XML-capable parser or XML-bearing upload/API flow |
+| SSTI | Server-side render/template behavior, not string reflection alone |
+| SQL/NoSQL/LDAP/XPath injection | Input plausibly reaches a corresponding query/expression sink and differential testing is meaningful |
+| XSS | User input reaches a browser-rendered context; confirmation requires executable context, not reflection alone |
+| Path traversal/download abuse | User-controlled file/path/object selection reaches file retrieval or storage behavior |
+| Malicious upload | File ingestion exists and downstream storage, parsing, rendering, or execution is observable |
+| Command injection/native weakness | Command/job/native or legacy component evidence exists |
+| Open redirect/OAuth flow abuse | User-controlled navigation target or redirect state exists |
+| Account/authenticator lifecycle | Observed login, reset, OTP, ownership, device, re-authentication, or approval transition |
+| Prompt/tool-use abuse | LLM/agent input reaches a privileged tool, data source, instruction boundary, or action; model text alone is insufficient |
+| Business logic | An observed state machine, trust transition, price/status/role field, approval, or cross-feature dependency exists |
 
-### 3. Choose High-Signal Attack Hypotheses
+If prerequisites are absent, set the candidate to `not-applicable` or leave the class `not-observed`; do not fetch more raw packets solely to prove absence.
 
-Do not treat the list below as closed. Build hypotheses from observed inputs and likely server-side sinks. Prioritize:
+### 4. Retrieve Progressively
 
-- Authentication bypass: protected resource without valid auth, token tampering, refresh misuse.
-- Authorization/RBAC bypass: low-privileged session reaches admin/export/write endpoints.
-- IDOR/BOLA: changing IDs exposes another tenant/store/user/object.
-- Sensitive data exposure: exports, keys, credentials, personal data, internal metadata.
-- XSS: payload is actually reflected/stored and executable in context.
-- CSRF: state-changing endpoint lacks anti-CSRF protection and uses ambient credentials.
-- Upload/download abuse: unsafe file retrieval, path traversal, unrestricted export.
-- Malicious file upload: script upload, executable upload location, content-type/extension bypass, archive traversal, or upload-to-
-execute chains.
-- SSRF: URL, webhook, image fetch, import, callback, metadata, or proxy-like parameters cause server-side DNS/HTTP interaction or
-internal resource access.
-- XXE: XML/SOAP/SAML/Office/SVG upload or XML API endpoints parse external entities or DTDs.
-- SSTI/template injection: template, message, email, report, CMS, or render parameters evaluate expressions instead of treating them as
-text.
-- Injection: SQL, NoSQL, LDAP, XPath, command, SSI, header, CRLF, format string, template, expression language, prompt/LLM, or
-deserialization only when response behavior, OOB interaction, timing, or downstream action proves a differential.
-- Account and authenticator lifecycle abuse: missing re-authentication on sensitive changes, ownership mismatch for phone/account/
-device/OTP, password reset/change flow bypass, identity verification step bypass, or approval-step bypass. Do not assess reuse, fixed,
-or guessable credential properties unless the user explicitly re-adds them.
-- Session and cookie abuse only when directly visible in the current traffic: signed token tampering, client-side role cookies,
-authorization-relevant cookie fields, or browser-visible session material.
-- Open redirect/phishing: redirect or return URL parameters allow navigation to attacker-controlled locations.
-- Exposure and surface hygiene: admin pages exposed to ordinary users, unnecessary sample/test/backup files, directory listing,
-unnecessary HTTP methods, browser-visible secrets in HTML/JavaScript/DOM/storage, and error/system information disclosure.
-- Native/legacy weakness checks: buffer overflow or format-string style probes only when long inputs, native gateways, CGI, or legacy
-components are suggested by History or technology evidence.
-- Business logic abuse: workflow skips, price/role/status tampering, missing approval gates, or race-sensitive actions when History
-exposes the state model.
-
-For each hypothesis, define a control comparison before sending requests.
-
-The parameter-name cues below are a reference aid for first-pass triage only. They are not the candidate list. Do not derive findings by
-matching parameter names against this table, and do not assume a name maps to its listed attack or that an absent name means the attack
-does not apply. Names are unreliable: dangerous behavior often hides behind generic names, and the highest-impact classes (IDOR/BOLA,
-authorization/RBAC, business logic) usually have no naming signal at all.
-
-Identify the actual candidates separately, from observed behavior and structure in History rather than from names:
-
-- For every identifier-carrying value seen in History, regardless of its name, encoding, or format, treat the object it references as an
-  IDOR/BOLA candidate and check whether authorization is enforced per object.
-- For every state-changing endpoint and multi-step flow in History, treat it as an authorization/RBAC, CSRF, and business-logic candidate.
-- For every input that reaches a server-side sink (fetch, parser, template/render, file path, query, command, export, LLM/tool call),
-  treat it as the matching injection/SSRF/XXE/SSTI/traversal candidate based on what the server does with it, not what the field is called.
-- Behavior decides the class: whether the server fetches the value, parses it, renders it, runs it, or checks authorization on it takes
-  precedence over any parameter name.
-
-Reference cues (triage hints only, not a checklist):
-
-- URL-like values (`url`, `uri`, `callback`, `webhook`, `image`, `avatar`, `redirect`, `host`, `endpoint`) -> SSRF/open redirect.
-- XML content types, SOAP, SAML, SVG, Office uploads, `xml` fields -> XXE/XML parser attacks.
-- `template`, `message`, `content`, `body`, `title`, `memo`, `description`, `email`, `report` -> XSS/SSTI/content injection.
-- `search`, `filter`, `sort`, `where`, `id`, `no`, `query`, JSON arrays/objects -> SQL/NoSQL/LDAP/XPath/IDOR.
-- `cmd`, `exec`, `job`, `script`, `path`, `file`, `filename`, archive/upload flows -> command injection/path traversal/deserialization.
-- `prompt`, `chat`, `assistant`, `agent`, `system`, `tool`, `model` -> prompt injection or tool-use abuse.
-- `redirect`, `return`, `next`, `continue`, `callback_url` -> open redirect or OAuth/SSO flow abuse.
-- `otp`, `sms`, `voice`, `email_code`, `password`, `reset`, `certificate`, `account`, `identity`, `verify`, `step` -> account/
-authenticator lifecycle, ownership, re-authentication, or flow bypass checks.
-- `page`, `download`, `template`, `sample`, `backup`, `admin`, `swagger`, `actuator`, `debug` paths -> exposed management or unnecessary
-files/features.
-
-### 4. Verify Safely
-
-Use the method that proves the claim without unnecessary side effects:
-
-- For download/export findings, execute the download when it is needed to prove impact. `HEAD` is optional for quick triage, but do not
-stop at `HEAD` if the body, file type, or sensitive content matters. Avoid storing large files unless necessary; record headers,
-filename, type, size, and a redacted content sample when useful.
-- For XSS, use the application's real input path and method: `GET`, `POST`, JSON, multipart, editor forms, upload metadata, or admin/CMS
-fields. The standard is actual script execution or a browser-rendered executable sink, not mere string reflection. Use harmless canaries
-and test/QA records where possible.
-- Use invalid/no-auth controls to distinguish authentication bypass from authorization bypass.
-- Use same endpoint with low-privileged versus unauthenticated requests where possible.
-- When verifying a related API host, send the request to the actual API `Host` and preserve relevant `Origin`, `Referer`, auth, CSRF,
-and custom headers from the captured browser request unless the hypothesis specifically tests their absence.
-- Use harmless canary payloads for reflection or parser behavior.
-- Use Burp Collaborator for SSRF/XXE/OOB injection when an internet-reachable callback is needed. If the target can reach the tester
-host, run the bundled local callback server from this skill directory instead:
-
-  ```bash
-  python3 <skill_dir>/scripts/oob_http_server.py --host 0.0.0.0 --port 8000
-  ```
-
-  Then use `http://<reachable-tester-ip>:8000/<canary>` as the callback URL. Prefer benign HTTP/DNS callbacks and avoid internal network
-  scanning.
-- For SSTI, start with arithmetic/string canaries such as engine-appropriate `7*7` expressions; do not jump to RCE payloads.
-- For SQL/NoSQL/LDAP/XPath, prefer boolean/error/differential checks against a baseline; avoid destructive writes or expensive time
-delays unless explicitly authorized.
-- For command injection, avoid destructive commands; use a benign canary only when the environment is authorized for that check.
-- For prompt injection, verify only observable application behavior such as instruction leakage, unauthorized tool/action invocation, or
-policy bypass; do not claim it from model text alone without impact.
-- For XXE, prefer parser error or OOB DNS/HTTP proof; do not request local file disclosure such as `/etc/passwd` unless explicitly
-authorized.
-- For account/authenticator lifecycle checks, use only owned test accounts and avoid account lockout, irreversible password changes, OTP
-spending, or third-party notifications unless explicitly authorized.
-- For admin/file exposure, start from paths observed in History or page links. Do not brute-force large wordlists unless explicitly
-authorized.
-- For HTTP methods, prefer `OPTIONS` or harmless method changes. Do not write with `PUT`, `DELETE`, or WebDAV methods outside a
-confirmed disposable path.
-- Do not execute destructive `POST`, `PUT`, `PATCH`, or `DELETE` requests unless the user explicitly authorizes it or a safe test
-fixture is confirmed. Harmless form/API submissions needed to prove XSS or content injection are acceptable in authorized QA scope when
-they can be identified and cleaned up.
-
-Classify evidence into one of four levels. Keep the boundaries sharp: the distinction between `Not exploitable` and `Not reproduced` is
-about the strength of the negative evidence, not about effort.
-
-- `Confirmed`: exploit condition is reproduced and has a control comparison.
-- `Needs confirmation`: a reachable dangerous surface exists but the result is not settled, because the final mutation/impact needs
-  authorization, or because access depends on an RBAC matrix or business rule not present in History. Always attach a one-line reason
-  (for example: "needs authorization to send the state-changing request" or "depends on RBAC matrix not in History").
-- `Not exploitable`: the input reaches the relevant sink, but a defense was actively observed to neutralize it, so absence is positively
-  demonstrated. Use only with concrete evidence of the defense, such as consistent output encoding across contexts for XSS, no error/
-  boolean/timing differential plus parameterization evidence for SQLi, or normalized/blocked traversal sequences. Record the observed
-  defense in one line.
-- `Not reproduced`: tested with reasonable payloads and no exploit condition appeared, but absence is not positively demonstrated —
-  the sample was partial or the class resists proof of absence (IDOR/BOLA, authorization, business logic, OOB-dependent SSRF/XXE). Note
-  the limitation in one line. Do not call this "safe".
-
-### 5. Checklist Coverage Pass
-
-Before writing the findings file, compare the observed target against the generic exploit-oriented web checklist classes below plus any
-project-specific checklist supplied by the current workspace or user. Exclude reuse/fixed/guessable credential checks, unlimited-
-request/rate-limit checks, and TLS/certificate checks unless the user explicitly re-adds them. Do not force every checklist item into
-active testing; classify coverage honestly:
-
-- `covered-confirmed`: tested and vulnerable.
-- `covered-not-reproduced`: tested with reasonable safe checks and not reproduced.
-- `observed-needs-manual`: History shows the feature exists, but proof would require destructive or environment-specific testing.
-- `not-observed`: no History evidence of the feature or sink.
-- `out-of-scope-low-signal`: mostly configuration/header hygiene without a concrete exploit path for this task.
-
-At minimum, ensure the pass considers: account/authenticator lifecycle where observed, cookie tampering where authorization-relevant,
-authorization/IDOR, injection families, upload/download/path traversal, malicious file upload, XSS/CSRF, SSRF/XXE/SSTI, open redirect,
-browser-visible sensitive data, admin/unnecessary files/directory listing/method exposure, system/error information disclosure, and
-business logic abuse.
-
-### 6. Write Findings File
-
-When there is at least one confirmed vulnerability or one item that needs manual/authorized confirmation, write a single findings file in
-the current working directory. If there are no such items, do not create a file; report "no findings to file" instead.
-
-- Format: `.md` (default) or `.txt`.
-- Location: the current folder. Do not write outside it. Each project is run separately, so do not append to or assume any pre-existing
-  findings file from another project.
-- File name: derive from the audit target, for example `<target_host>.md` (such as `app.example.com.md`) or, when the user gave a
-  feature/project name, `<project-or-feature>.md`. Keep one file per audit target.
-
-Keep the content lean: core issue plus payload only. Do not include the snapshot summary, checklist coverage matrix, control narrative,
-fix recommendations, or other prose. Redact secrets and use explicit placeholders.
-
-For each item, write only:
-
-- A heading with severity and a short issue name.
-- Location: method + path (+ API host if not the primary host).
-- One short line of impact / why it matters.
-- Status: `Confirmed` or `Needs confirmation`.
-- The payload, as a fenced block. Mark manual payloads as not executed if sending them would modify data.
-
-Suggested file shape:
-
-```md
-# <target_host> findings
-
-## [High] Stored XSS in <feature>
-- Location: POST /path/to/action
-- Impact: script executes in admin context
-- Status: Confirmed
-- Payload:
-  ```http
-  POST /path/to/action HTTP/1.1
-  Host: <target_host>
-  Cookie: <session_cookie_name>=<low_priv_session_or_access_token>
-  Content-Type: application/json
-
-  {"field":"<canary_payload>"}
-  ```
-
-## [Medium] IDOR on <resource>
-- Location: GET /api/orders/<id>
-- Impact: reads another tenant's object
-- Status: Needs confirmation (not executed — would read other user data)
-- Payload:
-  ```http
-  GET /api/orders/<other_object_id> HTTP/1.1
-  Host: <api_host>
-  Cookie: <authenticated_cookie>
-  ```
-```
-
-Provide specialized payloads only when the matching sink exists in History. Mark them as templates when values are placeholders:
-
-```http
-GET /fetch?url=http://<collaborator-payload>/canary HTTP/1.1
-Host: <target_host>
-Cookie: <authenticated_cookie>
-```
-
-For local OOB verification, replace `<collaborator-payload>` with `<reachable-tester-ip>:<port>` from `<skill_dir>/scripts/
-oob_http_server.py`.
-
-```xml
-<?xml version="1.0"?>
-<!DOCTYPE x [ <!ENTITY xxe SYSTEM "http://<collaborator-payload>/xxe"> ]>
-<root>&xxe;</root>
-```
+Use this order:
 
 ```text
-SSTI canaries: {{7*7}}, ${7*7}, <%= 7*7 %>, #{7*7}
-SQL canaries: ' OR '1'='1, ' AND '1'='2, order/sort baseline differentials
-Command canaries: ; echo codex_canary ;, && echo codex_canary
-Prompt canary: ignore prior instructions only inside a non-production LLM test fixture and verify impact through application behavior
+state metadata
+  -> compact request/response summary
+  -> one raw baseline packet
+  -> one differential/control packet
+  -> additional packet only when it can settle a high-value candidate
 ```
 
-## Reporting Format
+Preserve the captured method, host, protocol, headers, content type, and body shape. Redact secrets in notes and output, but use the authorized captured session when required for a valid test. When testing a hypothesis about a missing header/token, remove only that element and keep the rest stable.
 
-Report in the user's language. Keep it evidence-first. The chat report may summarize; the findings file holds the core issue and
-payloads.
+### 5. Verify Safely
 
-1. Confirmed vulnerabilities:
-   - Severity.
-   - Endpoint and attack path.
-   - Exact evidence: method, path, role/session context, status, important response headers/body indicators.
-   - Control result.
-   - Impact.
-   - Fix.
-   - Findings file name and the relevant entry.
-2. Needs confirmation:
-   - Why it is suspicious.
-   - What safe or authorized test would prove it.
-   - Findings file entry or manual payload if written.
-3. Not reproduced:
-   - Hypothesis and payload class tested.
-   - Observed result.
-4. Checklist coverage:
-   - Important checklist classes that were not observed, out of scope, or need manual/authorized testing.
-   - Do not list every low-signal item unless the user asks for a full checklist matrix.
-5. Sensitive handling:
-   - Redact passwords, tokens, session cookies, full API keys, billing/client keys, and personal identifiers unless the user explicitly
-   asks for raw values and disclosure is appropriate for the workspace.
+Use the least harmful test that distinguishes the hypothesis from its control:
+
+- Authentication: compare valid, invalid, expired/tampered where safely available, and unauthenticated behavior.
+- Authorization/IDOR: use owned test accounts and objects. Prefer same-object cross-role comparisons; do not read unrelated real-user data without explicit authorization.
+- CSRF: first evaluate deliverability and defenses. Send a state-changing proof only against a disposable fixture or with explicit authorization.
+- XSS: use harmless unique canaries through the real input path. Confirm executable browser context; reflection alone is insufficient.
+- SQL/NoSQL/LDAP/XPath: prefer boolean/error differentials against a stable baseline. Avoid destructive writes and expensive delay payloads unless explicitly authorized.
+- SSRF/XXE/OOB: use unique benign callbacks. Avoid internal-network scanning and local-file disclosure. Correlate the callback with a control.
+- SSTI: start with arithmetic or string canaries; do not escalate to code execution merely to increase impact.
+- File download/export: retrieve only enough content to prove type, ownership, and sensitivity; redact samples.
+- Upload: use harmless files and disposable paths. Do not upload executable content to production or attempt execution without explicit authorization.
+- Command injection: use a benign canary only in an authorized test environment; avoid destructive commands.
+- Account/OTP/approval flows: avoid lockout, irreversible credential changes, third-party notifications, charges, and OTP consumption unless authorized.
+- HTTP methods/admin files: begin with observed paths, `OPTIONS`, or harmless method changes; do not brute-force broad wordlists or write via `PUT`, `DELETE`, or WebDAV outside disposable scope.
+- Prompt/tool-use abuse: require observable unauthorized data access, tool invocation, state change, or instruction boundary failure; do not claim impact from suggestive model output alone.
+
+For every sent request, record candidate ID, packet reference, changed element, baseline result, control result, timestamp, and any cleanup needed.
+
+### 6. Classify Evidence
+
+Use these exact dispositions:
+
+- `confirmed`: exploit condition reproduced with a meaningful control comparison.
+- `needs-confirmation`: a reachable dangerous surface exists, but final proof is blocked by missing authorization, role/account/object fixture, browser execution, OOB visibility, or required business rule. Record a one-line blocker and the next safe test.
+- `not-exploitable`: the input reaches the relevant sink or boundary, and an observed defense positively neutralizes the tested condition. Record the concrete defense.
+- `not-reproduced`: reasonable testing produced no exploit condition, but absence is not positively demonstrated. Record the test scope and limitation; do not call it safe.
+- `not-applicable`: prerequisites for the class are contradicted or absent from the observed feature. No active test is required.
+- `blocked`: the test could not be performed because of tooling, access, state, or authorization constraints. Record the blocker without guessing a result.
+
+Do not convert `not-reproduced` to `not-exploitable` based on effort alone.
+
+### 7. Update Candidate and Feature State
+
+After each candidate, update its status, redacted evidence, test/control summaries, packet references, next action, and timestamp. Set `new_since_last_review` to `false` once triaged.
+
+After each feature, retain only a compact summary:
+
+```json
+{
+  "feature_id": "user-management",
+  "reviewed_candidate_ids": ["cand-001"],
+  "confirmed": [],
+  "open_candidates": ["cand-001 needs a second owned role"],
+  "negative_evidence": [],
+  "trust_relationships": ["userId propagates into order APIs"],
+  "state_transitions": [],
+  "last_reviewed_at": "<ISO-8601>"
+}
+```
+
+Do not store raw secrets or full packet bodies in state.
+
+### 8. Cross-Feature Review
+
+Run after the requested feature queue, or directly in `cross-feature` mode. Combine feature summaries, not all raw packets.
+
+Look for inconsistencies in:
+
+- Identity and session propagation.
+- Object ownership and tenant propagation.
+- Role and privilege transitions.
+- Price, quantity, discount, refund, and payment transitions.
+- Status and approval state machines.
+- Password reset, device binding, logout, token refresh, and re-authentication transitions.
+- Object IDs reused across ordinary and administrative features.
+- Inputs trusted by a downstream feature without server-side revalidation.
+
+Create a new candidate only when summaries support a concrete cross-feature hypothesis. Retrieve the minimum packets necessary to test that hypothesis; do not reopen unrelated feature traffic.
+
+### 9. Coverage Pass
+
+For each broad class, determine one of:
+
+- `covered-confirmed`
+- `covered-not-reproduced`
+- `observed-needs-manual`
+- `not-observed`
+- `not-applicable`
+- `out-of-scope-low-signal`
+
+Consider account/authenticator lifecycle, session/cookie tampering when authorization-relevant, authorization/IDOR, injection families, upload/download/traversal, malicious upload, XSS/CSRF, SSRF/XXE/SSTI, open redirect, browser-visible sensitive data, admin/unnecessary files/method exposure, error information disclosure, and business logic.
+
+Do not force raw-packet analysis for an unobserved or non-applicable class. Exclude credential-reuse/guessability, rate-limit/load testing, and TLS/certificate checks unless the user explicitly includes them.
+
+## Findings File
+
+When at least one candidate is `confirmed` or materially `needs-confirmation`, create or update one file in the current project:
+
+```text
+<target-host>.md
+```
+
+Use stable candidate IDs to update existing entries instead of duplicating them across repeated runs. If no candidate qualifies, do not create an empty file; report `no findings to file`.
+
+For each entry include only:
+
+- Severity and concise issue name.
+- Candidate ID.
+- Location: host, method, normalized path, and affected role/feature.
+- One-line impact.
+- Status: `Confirmed` or `Needs confirmation` with blocker.
+- Evidence: baseline and control result, kept brief and redacted.
+- Reusable HTTP payload in a fenced block, with explicit placeholders for secrets, accounts, IDs, callbacks, or destructive values.
+- Cleanup note only when applicable.
+
+Do not include large response bodies, live tokens, full personal data, broad checklist matrices, or speculative issues. Mark unexecuted payloads clearly.
+
+## Reporting
+
+Report in the user's language and lead with results:
+
+1. Confirmed findings and exact differential evidence.
+2. Needs-confirmation candidates and the single next test or missing prerequisite.
+3. Meaningful negative evidence; distinguish `not-exploitable` from `not-reproduced`.
+4. Features/classes not observed, not applicable, blocked, or still queued.
+5. State and findings file paths.
+
+Do not report a target or class as safe based on partial Burp History.
 
 ## Stop Condition
 
-Stop when all high-signal hypotheses from the snapshot and all relevant exploit-oriented checklist coverage classes have one of:
-confirmed, needs confirmation, not exploitable, not reproduced, not observed, or out of scope. Do not stop solely because one confirmed
-vulnerability has been found. Before finalizing, ensure the findings file contains entries (core issue + payload) for confirmed
-vulnerabilities and important manual checks.
+Stop when:
 
-Do not claim completion until related API hosts observed for the primary target flow have been included or explicitly classified as not
-relevant with evidence.
+1. Every candidate selected by the requested mode has a disposition or explicit queued/blocked state.
+2. Each selected feature has a compact saved summary.
+3. Applicable classes for those features have been considered.
+4. Cross-feature review has been completed when the requested mode requires it.
+5. State and the findings file, when warranted, have been updated without duplicate entries.
+
+Unobserved or non-applicable classes do not require further History searches. Report candidates left for a later `remaining`, `new`, or focused review rather than expanding context indefinitely.
