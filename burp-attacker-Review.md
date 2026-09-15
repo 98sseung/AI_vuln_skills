@@ -39,6 +39,7 @@ Select the smallest mode that satisfies the request:
 - `new`: review only candidates marked `new_since_last_review`.
 - `remaining`: continue unresolved candidates without reopening disposed ones.
 - `cross-feature`: analyze stored feature summaries and retrieve raw packets only for a specific cross-feature hypothesis.
+- `bypass <candidate-id>`: when a previously applicable high-risk candidate is blocked or transformed, run a bounded WAF/filter differential ladder against that candidate only.
 
 Do not interpret `all` as loading all raw packets at once. It means process the feature queue serially.
 
@@ -82,6 +83,23 @@ Process a single feature at a time. For each feature:
 
 Prioritize authentication, authorization, tenant boundaries, account security, admin functions, financial/approval actions, sensitive data, file operations, and proven server-side sinks.
 
+#### High-Risk and RCE-Related Priority Set
+
+Treat the following as explicit first-class candidate families when their prerequisites are observed. Do not rely on the generic term `injection families` to cover them implicitly:
+
+- OS command and argument injection.
+- Server-side code evaluation and framework expression injection, including EL, OGNL, SpEL, and MVEL-like sinks.
+- Server-side template injection (SSTI).
+- Server-Side Includes injection (SSI Injection).
+- Unsafe deserialization and gadget-triggered execution paths.
+- Malicious file upload, upload validation bypass, archive extraction abuse, and upload-to-webroot or upload-to-execution chains.
+- Local/remote file inclusion and path traversal that can reach interpretation, inclusion, overwrite, or execution.
+- XXE or SSRF chains that reach privileged internal services, management interfaces, file writes, or execution-capable endpoints.
+- Exposed debug, console, job runner, script, plugin, package, deployment, or administrative functions capable of server-side execution.
+- Memory-corruption/native gateway candidates only when CGI, native modules, unsafe parsers, or legacy components are supported by technology evidence.
+
+Prioritize these candidates highly, but distinguish the primitive from its final impact. A successful upload, template error, include reflection, parser exception, or HTTP 500 does not by itself prove RCE.
+
 ### 3. Apply Class Gates
 
 Activate a class only when its prerequisites are observed:
@@ -94,11 +112,15 @@ Activate a class only when its prerequisites are observed:
 | SSRF | Evidence that the server consumes a URL/host or performs a fetch/callback/import |
 | XXE | XML-capable parser or XML-bearing upload/API flow |
 | SSTI | Server-side render/template behavior, not string reflection alone |
-| SQL/NoSQL/LDAP/XPath injection | Input plausibly reaches a corresponding query/expression sink and differential testing is meaningful |
+| SSI Injection | SSI-capable file/page handling, include directives, `.shtml`/`.shtm`, CGI, or user-controlled content rendered by an SSI-enabled server |
+| Expression language/code evaluation | Framework expression or dynamic evaluation behavior suggesting EL, OGNL, SpEL, MVEL, script, or code-evaluation sinks |
+| Unsafe deserialization | Serialized object formats, binary/base64 object state, type metadata, object streams, dynamic class loading, or parser behavior consistent with object reconstruction |
+| SQL/NoSQL/LDAP/XPath injection | Input plausibly reaches a corresponding query sink and differential testing is meaningful |
 | XSS | User input reaches a browser-rendered context; confirmation requires executable context, not reflection alone |
-| Path traversal/download abuse | User-controlled file/path/object selection reaches file retrieval or storage behavior |
-| Malicious upload | File ingestion exists and downstream storage, parsing, rendering, or execution is observable |
-| Command injection/native weakness | Command/job/native or legacy component evidence exists |
+| Path traversal/LFI/RFI/download abuse | User-controlled file/path/object/include selection reaches file retrieval, inclusion, overwrite, or storage behavior |
+| Malicious upload/upload-to-execution | File ingestion exists and downstream storage, archive extraction, parsing, rendering, webroot placement, inclusion, or execution is observable |
+| Command/argument injection | Command, process, job, script, converter, compiler, diagnostic, or system utility invocation is supported by observed behavior |
+| Native/legacy weakness | CGI, native modules, unsafe parsers, long-input boundaries, or legacy components are supported by technology evidence |
 | Open redirect/OAuth flow abuse | User-controlled navigation target or redirect state exists |
 | Account/authenticator lifecycle | Observed login, reset, OTP, ownership, device, re-authentication, or approval transition |
 | Prompt/tool-use abuse | LLM/agent input reaches a privileged tool, data source, instruction boundary, or action; model text alone is insufficient |
@@ -106,7 +128,77 @@ Activate a class only when its prerequisites are observed:
 
 If prerequisites are absent, set the candidate to `not-applicable` or leave the class `not-observed`; do not fetch more raw packets solely to prove absence.
 
-### 4. Retrieve Progressively
+### 4. Distinguish WAF, Filter, and Application Behavior
+
+When an applicable high-risk candidate is blocked, stripped, rewritten, normalized, or inconsistently handled, determine the enforcement layer before concluding it is mitigated:
+
+- Edge/WAF: challenge or block template, edge-specific headers/request ID, connection behavior, or a response inconsistent with the application baseline.
+- Application gateway/framework: request accepted by the edge but rejected during routing, binding, deserialization, validation, or parser handling.
+- Application defense: the request reaches the feature and the dangerous value is safely rejected, encoded, parameterized, normalized, or treated as inert data.
+- Unknown: evidence cannot reliably distinguish the layer.
+
+Record status, headers, body signature/hash, length class, latency class, application markers, and any unique request ID. A `403`, `406`, connection reset, different error page, or WAF fingerprint proves filtering behavior only; it does not prove the underlying vulnerability is fixed or bypassed.
+
+#### Bounded WAF/Filter Bypass Procedure
+
+Use this procedure only for an already-applicable candidate and only within the authorized target scope:
+
+1. Capture a normal application baseline, a known-inert control, and the blocked/filtered candidate.
+2. Identify the likely transformation boundary: URL decoder, proxy, WAF rule, router, body parser, template engine, file validator, query builder, shell wrapper, or downstream service.
+3. Change one transformation dimension at a time so the decisive cause remains attributable.
+4. Compare edge response and application behavior against both controls.
+5. Stop when the sink is reached and the hypothesis can be classified, or when the bounded variant budget is exhausted.
+
+Permitted transformation families for controlled differential testing include:
+
+- Canonicalization: encoding layer, case, whitespace, Unicode normalization, delimiter, separator, comment, quoting, and path normalization variants.
+- GET/query token separation: when the underlying sink grammar supports it, try one comment-based separator such as `/**/` in place of a blocked whitespace/token boundary. Apply it only to the candidate parameter, not every query parameter.
+- POST body inspection-window testing: add one bounded, syntactically valid, inert padding value that the application safely ignores or accepts, while preserving the candidate's decoded meaning and body schema. Do not use oversized bodies or repeated padding growth that could create load.
+- Structural representation: query versus body placement, form/JSON/XML/multipart representation, scalar versus array/object shape, nesting, alternate but application-supported methods, and filename/content-type metadata.
+- Parser differentials: duplicate parameters or keys, ordering, empty/null values, mixed encodings, and proxy/framework interpretation differences.
+- Equivalent grammar: context-appropriate alternate operators, functions, expression syntax, template delimiters, SSI forms, shell quoting/separators, or database dialect constructs.
+- Upload handling: filename normalization, extension and case handling, declared versus detected media type, archive extraction, storage path, retrieval path, and downstream rendering/parsing behavior.
+
+Choose variants as a minimum distinguishing set, not as a payload list. Use at most one representative from each relevant family in the initial pass:
+
+| Observation or hypothesis | First distinct variant |
+| --- | --- |
+| GET parameter is blocked at a token/whitespace boundary | One `/**/`-style comment separator, if valid for the suspected sink |
+| POST body appears subject to a bounded inspection window | One modest inert-padding variant with an unchanged application-level control |
+| WAF and application may decode differently | One encoding/canonicalization variant |
+| Edge and framework may bind parameters differently | One duplicate-key, array/nesting, or parameter-location variant selected from captured application behavior |
+| Body parser or route handling appears content-type dependent | One alternate representation that the endpoint is already known to support |
+| Template, SSI, expression, query, or shell grammar is filtered by signature | One semantically equivalent grammar variant appropriate to that exact sink |
+| Upload filtering differs from downstream handling | One filename/media-type/storage or retrieval-path differential using a harmless file |
+
+Do not combine multiple obfuscations in the first request. Preserve a transformation ledger so successful behavior can be reduced to the minimum necessary change. Fingerprint each attempt by transformation family, decoded semantic value, parameter location, content type, and body shape; skip an attempt when that fingerprint is equivalent to one already tested.
+
+Default budget per candidate:
+
+- Initial pass: up to 4 variants from different transformation families.
+- Hard cap: 8 total transformation variants.
+- At most 1 initial variant per family. A second variant from the same family is allowed only when the first result provides new evidence that the family targets the correct enforcement boundary.
+- Up to 2 control requests in addition to the captured baseline.
+- One dimension changed per variant whenever possible.
+
+Stop early when three distinct transformation families return the same block signature and no new application evidence, or when two variants from one family are equivalent after decoding/normalization. Exceed the hard cap only when the user requests deeper bypass work and the next small set of variants is likely to settle a critical candidate. Do not use large payload dictionaries, uncontrolled fuzzing, request floods, or parser-desynchronization tests with cross-user impact. HTTP request-smuggling/desync checks require explicit authorization and isolated connection handling because they may affect other users.
+
+Do not disable logging, suppress defensive telemetry, rotate identities to evade controls, or treat rate-limit exhaustion as a bypass technique. Retain correlation/request IDs when available so the activity remains auditable.
+
+#### Bypass Outcome Standard
+
+Use precise intermediate outcomes:
+
+- `blocked-at-edge`: repeatable edge/WAF rejection; application reachability not shown.
+- `rejected-by-application`: application processed the request and applied a concrete defense.
+- `normalized-and-neutralized`: canonicalization occurred and the resulting value was rendered or processed inertly.
+- `parser-differential-observed`: layers interpreted an equivalent request differently, but exploit impact is not yet proven.
+- `sink-reached`: the transformed request reached the relevant sink; exploit condition remains to be classified.
+- `bypass-confirmed`: the transformed request passed the control and reproduced the underlying exploit condition with a negative control.
+
+Only `bypass-confirmed` may support a vulnerability finding. `blocked-at-edge`, a changed status code, or `sink-reached` without exploit impact is not enough.
+
+### 5. Retrieve Progressively
 
 Use this order:
 
@@ -120,7 +212,7 @@ state metadata
 
 Preserve the captured method, host, protocol, headers, content type, and body shape. Redact secrets in notes and output, but use the authorized captured session when required for a valid test. When testing a hypothesis about a missing header/token, remove only that element and keep the rest stable.
 
-### 5. Verify Safely
+### 6. Verify Safely
 
 Use the least harmful test that distinguishes the hypothesis from its control:
 
@@ -131,16 +223,32 @@ Use the least harmful test that distinguishes the hypothesis from its control:
 - SQL/NoSQL/LDAP/XPath: prefer boolean/error differentials against a stable baseline. Avoid destructive writes and expensive delay payloads unless explicitly authorized.
 - SSRF/XXE/OOB: use unique benign callbacks. Avoid internal-network scanning and local-file disclosure. Correlate the callback with a control.
 - SSTI: start with arithmetic or string canaries; do not escalate to code execution merely to increase impact.
+- SSI Injection: begin with a harmless non-command directive such as a date or controlled environment-variable echo in disposable content, paired with an inert-text control. Do not invoke command-executing SSI directives without explicit authorization.
+- Expression language/code evaluation: begin with arithmetic or string canaries and a syntactically similar inert control. Treat evaluation as confirmed only when the server returns or uses the computed result consistently.
+- Unsafe deserialization: first establish object reconstruction through format, type-resolution, parser, or controlled callback differentials. Do not use destructive or public gadget chains against production; require explicit authorization and an isolated/disposable target before execution-oriented confirmation.
 - File download/export: retrieve only enough content to prove type, ownership, and sensitivity; redact samples.
-- Upload: use harmless files and disposable paths. Do not upload executable content to production or attempt execution without explicit authorization.
+- Upload: test extension, content type, filename/path, archive handling, retrieval, and storage location with harmless files and disposable paths. Do not upload a webshell or executable payload to production. An upload-to-execution test requires explicit authorization and a controlled non-destructive canary that can be cleaned up.
 - Command injection: use a benign canary only in an authorized test environment; avoid destructive commands.
+- WAF/filter handling: if the baseline exploit canary is blocked but the class prerequisites remain valid, use the bounded differential procedure above. Confirm the underlying sink and impact rather than reporting a bypass from status-code changes alone.
+- Path traversal/LFI/RFI: prefer owned canary files and controlled include targets. Do not retrieve sensitive operating-system files or include remote executable content without explicit authorization.
 - Account/OTP/approval flows: avoid lockout, irreversible credential changes, third-party notifications, charges, and OTP consumption unless authorized.
 - HTTP methods/admin files: begin with observed paths, `OPTIONS`, or harmless method changes; do not brute-force broad wordlists or write via `PUT`, `DELETE`, or WebDAV outside disposable scope.
 - Prompt/tool-use abuse: require observable unauthorized data access, tool invocation, state change, or instruction boundary failure; do not claim impact from suggestive model output alone.
 
 For every sent request, record candidate ID, packet reference, changed element, baseline result, control result, timestamp, and any cleanup needed.
 
-### 6. Classify Evidence
+#### RCE Confirmation Standard
+
+Classify server-side code or command execution as `confirmed` only when all of the following are present:
+
+1. A controlled input reaches an execution-capable sink or chain.
+2. A unique, non-destructive server-side effect or computed result is observed.
+3. A meaningful inert/negative control does not produce that effect.
+4. The effect is attributable to the target server rather than client-side rendering, reflection, caching, or an unrelated callback.
+
+If the primitive is proven but execution requires a higher-risk step, classify the primitive appropriately and mark the RCE impact `needs-confirmation`. Do not inflate severity from upload success, error messages, timing noise, or technology fingerprints alone.
+
+### 7. Classify Evidence
 
 Use these exact dispositions:
 
@@ -153,7 +261,9 @@ Use these exact dispositions:
 
 Do not convert `not-reproduced` to `not-exploitable` based on effort alone.
 
-### 7. Update Candidate and Feature State
+For filter-protected candidates, also retain the enforcement layer, transformation family, exact single change, edge result, application result, control result, and one of the bypass outcomes above. A WAF block does not automatically justify `not-exploitable`.
+
+### 8. Update Candidate and Feature State
 
 After each candidate, update its status, redacted evidence, test/control summaries, packet references, next action, and timestamp. Set `new_since_last_review` to `false` once triaged.
 
@@ -174,7 +284,7 @@ After each feature, retain only a compact summary:
 
 Do not store raw secrets or full packet bodies in state.
 
-### 8. Cross-Feature Review
+### 9. Cross-Feature Review
 
 Run after the requested feature queue, or directly in `cross-feature` mode. Combine feature summaries, not all raw packets.
 
@@ -191,7 +301,7 @@ Look for inconsistencies in:
 
 Create a new candidate only when summaries support a concrete cross-feature hypothesis. Retrieve the minimum packets necessary to test that hypothesis; do not reopen unrelated feature traffic.
 
-### 9. Coverage Pass
+### 10. Coverage Pass
 
 For each broad class, determine one of:
 
@@ -202,7 +312,7 @@ For each broad class, determine one of:
 - `not-applicable`
 - `out-of-scope-low-signal`
 
-Consider account/authenticator lifecycle, session/cookie tampering when authorization-relevant, authorization/IDOR, injection families, upload/download/traversal, malicious upload, XSS/CSRF, SSRF/XXE/SSTI, open redirect, browser-visible sensitive data, admin/unnecessary files/method exposure, error information disclosure, and business logic.
+Consider account/authenticator lifecycle, session/cookie tampering when authorization-relevant, authorization/IDOR, SQL/NoSQL/LDAP/XPath injection, command/argument injection, expression-language/code evaluation, SSTI, SSI Injection, unsafe deserialization, upload/download/traversal/LFI/RFI, malicious upload and upload-to-execution, XSS/CSRF, SSRF/XXE and execution chains, open redirect, browser-visible sensitive data, debug/console/job-runner/admin exposure, native/legacy weakness where evidenced, error information disclosure, business logic, and WAF/filter/parser differentials for applicable high-risk candidates.
 
 Do not force raw-packet analysis for an unobserved or non-applicable class. Exclude credential-reuse/guessability, rate-limit/load testing, and TLS/certificate checks unless the user explicitly includes them.
 

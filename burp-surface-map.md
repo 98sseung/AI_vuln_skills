@@ -87,9 +87,10 @@ For each useful History item, record metadata first:
 - Request content type and sorted parameter/key names; do not store secrets.
 - Authentication mode such as cookie, bearer, basic, mutual TLS indicator, or unauthenticated. Store names and roles, not credential values.
 - Status, response content type, response length, redirect target class, and compact response schema/field names.
+- Edge/filter indicators: WAF/CDN headers, block-page signatures, challenge/captcha behavior, rate/deny status patterns, request IDs, and evidence that values were removed, decoded, normalized, or rewritten before application handling. When prior test traffic exists, also note equivalent GET token/comment forms, POST body-length or inert-padding differentials, duplicate-key binding, and content-type/parser differences without generating new requests.
 - State-changing flag.
 - Observed role/account context when supported by evidence.
-- Security-relevant traits: identifier, upload, download, export, redirect, URL fetch, XML/parser, render/template, search/query, admin, account lifecycle, payment, approval, LLM/tool use, or sensitive response.
+- Security-relevant traits: identifier, upload, download, export, redirect, URL fetch, XML/parser, render/template, SSI processing, expression language, serialized object, dynamic class loading, command/job execution, native/CGI gateway, admin, account lifecycle, payment, approval, LLM/tool use, or sensitive response.
 
 Do not copy large raw request or response bodies into state. Store packet references and redacted summaries.
 
@@ -148,13 +149,17 @@ Determine applicability for every broad vulnerability family, but activate a cla
 | URL fetch, webhook, import, proxy | SSRF; open redirect only for client navigation behavior |
 | XML/SOAP/SAML/SVG/Office parsing | XXE and parser abuse |
 | Template/render/message/report sink | XSS, SSTI, content injection as behavior supports |
-| Search/filter/query expression | SQL/NoSQL/LDAP/XPath or expression injection as behavior supports |
-| File path, download, archive, upload | Traversal, IDOR, unsafe download, malicious upload, archive abuse |
-| Command/job/script/native gateway | Command injection or native weakness only with supporting technology evidence |
+| SSI-capable page, include directive, `.shtml`/`.shtm`, CGI, or user content rendered by an SSI-enabled server | SSI injection and possible file disclosure/command-execution chain |
+| Framework expression or dynamic evaluation context | EL/OGNL/SpEL/MVEL/expression injection and possible code-execution chain |
+| Search/filter/query expression | SQL/NoSQL/LDAP/XPath injection as behavior supports |
+| Serialized object, opaque binary/base64 state, type metadata, object stream, or dynamic class loading | Unsafe deserialization and gadget-triggered code-execution candidate |
+| File path, download, include, archive, or upload | Traversal, LFI/RFI, IDOR, unsafe download, malicious upload, archive extraction abuse, upload-to-execution chain |
+| Command/job/script/eval/native/CGI gateway | OS command, argument, code, or SSI injection; native weakness only with supporting technology evidence |
 | Redirect/return/next destination | Open redirect, OAuth/SSO flow abuse |
 | Login/reset/OTP/device/approval flow | Authentication and authenticator lifecycle, ownership, step bypass |
 | LLM prompt, agent, model, tool input | Prompt/tool-use abuse only when application impact is observable |
 | Sensitive browser-visible response | Sensitive data exposure, authorization, client-side secret handling |
+| Block page, filter rejection, input stripping, canonicalization, GET comment/token variation, POST body-padding/length difference, or edge/application parser differential | Filter/WAF bypass candidate linked to the underlying applicable vulnerability class; a block response alone is not a vulnerability |
 
 Candidate generation is not verification. Do not label an issue vulnerable from parameter names or structure alone.
 
@@ -162,10 +167,12 @@ Candidate generation is not verification. Do not label an issue vulnerable from 
 
 Score attention priority from observed evidence. Use the score as a queueing aid, not a severity rating:
 
+- `+6`: direct or plausible server-side code/command-execution primitive, unsafe deserialization, or upload-to-execution chain.
 - `+5`: privileged/admin action or authentication/security setting.
 - `+4`: authorization-sensitive object, financial action, approval, role/status/price transition.
-- `+3`: user-controlled identifier, file path/upload/download, URL/parser/template/command sink.
+- `+3`: user-controlled identifier, file path/upload/download, URL/parser/template/SSI/expression/command sink.
 - `+2`: sensitive response, ownership/tenant field, meaningful auth/status/schema differential.
+- `+2`: repeatable WAF-versus-application, decoder, parser, content-type, or normalization differential affecting a high-risk sink.
 - `+1`: unusual error, method, or redirect differential.
 
 Suggested queue bands:
